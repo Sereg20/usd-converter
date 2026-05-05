@@ -137,6 +137,44 @@ bot.hears("📊 График за месяц", async (ctx) => {
   }
 });
 
+// Обработка текстовых сообщений для конвертации (например, "100", "10.5$", "50 byn")
+bot.hears(/^\s*(\d+(?:[.,]\d+)?)\s*(usd|\$|дол|доллар|byn|р|руб|бел)?\s*$/i, async (ctx) => {
+    try {
+        // Парсим сумму, меняем запятую на точку (чтобы 10,5 считалось как 10.5)
+        const amount = parseFloat(ctx.match[1].replace(',', '.'));
+        const currency = ctx.match[2] ? ctx.match[2].toLowerCase() : null;
+
+        // Получаем актуальный курс
+        const today = new Date();
+        const rate = await getUsdRate(today);
+
+        let replyText = '';
+
+        // Определяем валюту по ключевым словам
+        const isUsd = ['usd', '$', 'дол', 'доллар'].includes(currency);
+        const isByn = ['byn', 'р', 'руб', 'бел'].includes(currency);
+
+        if (isUsd) {
+            const bynResult = (amount * rate).toFixed(2);
+            replyText = `🇺🇸 **${amount} USD** = 🇧🇾 **${bynResult} BYN**`;
+        } else if (isByn) {
+            const usdResult = (amount / rate).toFixed(2);
+            replyText = `🇧🇾 **${amount} BYN** = 🇺🇸 **${usdResult} USD**`;
+        } else {
+            // Если валюта не указана, показываем сразу оба варианта
+            const bynResult = (amount * rate).toFixed(2);
+            const usdResult = (amount / rate).toFixed(2);
+            replyText = `⚖️ **Конвертация ${amount}:**\n\n🇺🇸 ${amount} USD = 🇧🇾 **${bynResult} BYN**\n🇧🇾 ${amount} BYN = 🇺🇸 **${usdResult} USD**`;
+        }
+
+        await ctx.replyWithMarkdown(replyText);
+
+    } catch (error) {
+        console.error("❌ Ошибка при конвертации:", error.message);
+        ctx.reply("❌ Произошла ошибка при расчете. Попробуй позже.");
+    }
+});
+
 // ==========================================
 // 3. ЭКСПОРТ ДЛЯ VERCEL (Serverless Handler)
 // ==========================================

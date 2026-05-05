@@ -1,95 +1,30 @@
 const { Telegraf } = require('telegraf');
-const axios = require('axios');
-const QuickChart = require('quickchart-js');
 
-// ==========================================
-// 1. БАЗОВАЯ ЛОГИКА (Data Layer)
-// ==========================================
-
-async function getUsdRate(date) {
-  const dateString = date.toISOString().split('T')[0];
-  const url = `https://api.nbrb.by/exrates/rates/431?ondate=${dateString}`;
-  const response = await axios.get(url);
-  return response.data.Cur_OfficialRate;
-}
-
-async function getRatesData() {
-  const today = new Date();
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-
-  const rateToday = await getUsdRate(today);
-  const rateYesterday = await getUsdRate(yesterday);
-  const diff = parseFloat((rateToday - rateYesterday).toFixed(4));
-
-  return { rateToday, rateYesterday, diff };
-}
-
-async function getMonthlyDynamics() {
-  const endDate = new Date();
-  const startDate = new Date();
-  startDate.setDate(endDate.getDate() - 30);
-
-  const startStr = startDate.toISOString().split('T')[0];
-  const endStr = endDate.toISOString().split('T')[0];
-
-  const url = `https://api.nbrb.by/exrates/rates/dynamics/431?startdate=${startStr}&enddate=${endStr}`;
-  const response = await axios.get(url);
-  return response.data;
-}
-
-async function getChartUrl() {
-  const data = await getMonthlyDynamics();
-
-  const labels = data.map(item => {
-    const d = new Date(item.Date);
-    return `${d.getDate()}.${d.getMonth() + 1}`;
-  });
-  const rates = data.map(item => item.Cur_OfficialRate);
-
-  const chart = new QuickChart();
-  chart.setWidth(600);
-  chart.setHeight(400);
-  chart.setBackgroundColor('white');
-
-  chart.setConfig({
-    type: 'line',
-    data: {
-      labels: labels,
-      datasets: [{
-        label: 'Курс USD к BYN',
-        data: rates,
-        borderColor: '#007bff',
-        backgroundColor: 'rgba(0, 123, 255, 0.1)',
-        fill: true,
-        borderWidth: 2,
-        pointRadius: 2
-      }]
-    },
-    options: {
-      legend: { display: false },
-      title: { display: true, text: 'Динамика USD за 30 дней' },
-      // === НОВЫЙ БЛОК НАСТРОЕК ОСЕЙ ===
-      scales: {
-        yAxes: [{
-          ticks: {
-            beginAtZero: false // Отключаем старт с нуля
-          }
-        }]
-      }
-      // =================================
-    }
-  });
-
-  return chart.getUrl();
-}
-
-// ==========================================
-// 2. ЛОГИКА ТЕЛЕГРАМ БОТА
-// ==========================================
+// Импортируем наши сервисы
+const { getRatesData, getUsdRate } = require('../src/nbrb');
+const { getChartUrl } = require('../src/chart');
+const { getAiForecast } = require('../src/ai');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+const mainKeyboard = {
+  reply_markup: {
+    keyboard: [
+      [{ text: "💵 Узнать курс USD" }, { text: "📊 График за месяц" }],
+      [{ text: "🔮 AI Прогноз" }]
+    ],
+    resize_keyboard: true
+  }
+};
+
+bot.start((ctx) => {
+  ctx.reply(
+    "Привет! Выбери действие на клавиатуре ниже.\n\n💡 **Лайфхак:** отправь мне любую сумму (например, `100$`, `50 byn` или просто `100`), и я мгновенно её конвертирую!",
+    { ...mainKeyboard, parse_mode: 'Markdown' }
+  );
+});
+
+// === 1. ЗАПРОС КУРСА ===
 function formatTelegramMessage(data) {
   let trend = '➖ Без изменений';
   if (data.diff > 0) trend = `📈 Вырос на ${data.diff}`;
@@ -108,23 +43,38 @@ async function sendRate(ctx) {
   }
 }
 
-const mainKeyboard = {
-  reply_markup: {
-    keyboard: [
-      [{ text: "💵 Узнать курс USD" }, { text: "📊 График за месяц" }]
-    ],
-    resize_keyboard: true
-  }
-};
-
-bot.start((ctx) => {
-  ctx.reply("Привет! Выбери действие на клавиатуре ниже:", mainKeyboard);
-});
-
 bot.command('rate', (ctx) => sendRate(ctx));
 bot.hears(/курс/i, (ctx) => sendRate(ctx));
 bot.hears("💵 Узнать курс USD", (ctx) => sendRate(ctx));
 
+// === 2. КОНВЕРТЕР ===
+bot.hears(/^\s*(\d+(?:[.,]\d+)?)\s*(usd|\$|дол|доллар|byn|р|руб|бел)?\s*$/i, async (ctx) => {
+  try {
+    const amount = parseFloat(ctx.match[1].replace(',', '.'));
+    const currency = ctx.match[2] ? ctx.match[2].toLowerCase() : null;
+
+    const rate = await getUsdRate(new Date());
+    let replyText = '';
+
+    const isUsd = ['usd', '$', 'дол', 'доллар'].includes(currency);
+    const isByn = ['byn', 'р', 'руб', 'бел'].includes(currency);
+
+    if (isUsd) {
+      replyText = `🇺🇸 **${amount} USD** = 🇧🇾 **${(amount * rate).toFixed(2)} BYN**`;
+    } else if (isByn) {
+      replyText = `🇧🇾 **${amount} BYN** = 🇺🇸 **${(amount / rate).toFixed(2)} USD**`;
+    } else {
+      replyText = `⚖️ **Конвертация ${amount}:**\n\n🇺🇸 ${amount} USD = 🇧🇾 **${(amount * rate).toFixed(2)} BYN**\n🇧🇾 ${amount} BYN = 🇺🇸 **${(amount / rate).toFixed(2)} USD**`;
+    }
+
+    await ctx.replyWithMarkdown(replyText);
+  } catch (error) {
+    console.error("❌ Ошибка при конвертации:", error.message);
+    ctx.reply("❌ Произошла ошибка при расчете. Попробуй позже.");
+  }
+});
+
+// === 3. ГРАФИК ===
 bot.hears("📊 График за месяц", async (ctx) => {
   try {
     const waitMsg = await ctx.reply("⏳ Запрашиваю данные у НБРБ...");
@@ -137,55 +87,24 @@ bot.hears("📊 График за месяц", async (ctx) => {
   }
 });
 
-// Обработка текстовых сообщений для конвертации (например, "100", "10.5$", "50 byn")
-bot.hears(/^\s*(\d+(?:[.,]\d+)?)\s*(usd|\$|дол|доллар|byn|р|руб|бел)?\s*$/i, async (ctx) => {
-    try {
-        // Парсим сумму, меняем запятую на точку (чтобы 10,5 считалось как 10.5)
-        const amount = parseFloat(ctx.match[1].replace(',', '.'));
-        const currency = ctx.match[2] ? ctx.match[2].toLowerCase() : null;
-
-        // Получаем актуальный курс
-        const today = new Date();
-        const rate = await getUsdRate(today);
-
-        let replyText = '';
-
-        // Определяем валюту по ключевым словам
-        const isUsd = ['usd', '$', 'дол', 'доллар'].includes(currency);
-        const isByn = ['byn', 'р', 'руб', 'бел'].includes(currency);
-
-        if (isUsd) {
-            const bynResult = (amount * rate).toFixed(2);
-            replyText = `🇺🇸 **${amount} USD** = 🇧🇾 **${bynResult} BYN**`;
-        } else if (isByn) {
-            const usdResult = (amount / rate).toFixed(2);
-            replyText = `🇧🇾 **${amount} BYN** = 🇺🇸 **${usdResult} USD**`;
-        } else {
-            // Если валюта не указана, показываем сразу оба варианта
-            const bynResult = (amount * rate).toFixed(2);
-            const usdResult = (amount / rate).toFixed(2);
-            replyText = `⚖️ **Конвертация ${amount}:**\n\n🇺🇸 ${amount} USD = 🇧🇾 **${bynResult} BYN**\n🇧🇾 ${amount} BYN = 🇺🇸 **${usdResult} USD**`;
-        }
-
-        await ctx.replyWithMarkdown(replyText);
-
-    } catch (error) {
-        console.error("❌ Ошибка при конвертации:", error.message);
-        ctx.reply("❌ Произошла ошибка при расчете. Попробуй позже.");
-    }
+// === 4. ИИ ПРОГНОЗ ===
+bot.hears("🔮 AI Прогноз", async (ctx) => {
+  try {
+    const waitMsg = await ctx.reply("⏳ Собираю финансовые сводки и запускаю нейросеть Gemini. Секундочку...");
+    const forecast = await getAiForecast();
+    await ctx.replyWithMarkdown(forecast);
+    await ctx.deleteMessage(waitMsg.message_id);
+  } catch (error) {
+    console.error("❌ Ошибка при генерации AI прогноза:", error.message);
+    ctx.reply("❌ Не удалось получить прогноз. Возможно, проблемы с API или таймаут.");
+  }
 });
 
-// ==========================================
-// 3. ЭКСПОРТ ДЛЯ VERCEL (Serverless Handler)
-// ==========================================
-
+// === ЭКСПОРТ ДЛЯ VERCEL ===
 module.exports = async (req, res) => {
-  // Если просто перейти по ссылке в браузере
   if (req.method === 'GET') {
     return res.status(200).send('Бот жив и работает на Vercel!');
   }
-
-  // Если запрос пришел от Telegram
   try {
     await bot.handleUpdate(req.body);
     res.status(200).send('OK');
